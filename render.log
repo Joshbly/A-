@@ -1,0 +1,36 @@
+[geo] geocoding addresses…
+  origin = (42.07716, -87.70471)
+  dest   = (41.78458, -87.78492)
+[osm] fetching drive network for bbox N42.117 S41.745 E-87.545 W-87.945…
+  fetched 294385 nodes, 534500 edges in 29.0s
+[osm] projecting to UTM…
+[osm] annotating edges with speed + travel_time…
+  set 6417 motorway edges → 75 mph, 10643 motorway_link edges → 55 mph
+  origin node 13162015941  dest node 11808103814
+[render] canvas: 1532×1920
+[astar] running A*…
+  heuristic top speed: 120.7 kph
+  explored 176826 edges, path has 942 nodes, dt=1.19s
+[render] drawing base road layer…
+[render] caching edge polylines in pixel space…
+[render] phase 1: exploration (960 frames)
+  frame 1/960  edges 0/176826  0.1s
+  frame 61/960  edges 2051/176826  8.6s
+  frame 121/960  edges 7719/176826  17.3s
+  frame 181/960  edges 16487/176826  26.0s
+  frame 241/960  edges 27836/176826  34.9s
+  frame 301/960  edges 41249/176826  43.5s
+  frame 361/960  edges 56208/176826  52.3s
+  frame 421/960  edges 72193/176826  61.2s
+  frame 481/960  edges 88689/176826  69.9s
+  frame 541/960  edges 105175/176826  78.7s
+  frame 601/960  edges 121136/176826  87.5s
+  frame 661/960  edges 136051/176826  96.5s
+  frame 721/960  edges 149403/176826  105.5s
+  frame 781/960  edges 160675/176826  114.3s
+  frame 841/960  edges 169348/176826  123.1s
+  frame 901/960  edges 174904/176826  131.9s
+  frame 960/960  edges 176826/176826  140.6s
+[render] phase 2: path reveal (180 frames)
+[render] phase 3: hold (120 frames)
+[done] wrote chicago_astar_wide.mp4 (1260 frames @ 30fps)

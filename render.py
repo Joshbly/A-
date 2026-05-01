@@ -108,8 +108,10 @@ SIMPLIFY_GRAPH = False   # False → keep every OSM node; slower render but catc
 # Graph cache is keyed on the origin/dest pair so switching routes doesn't silently reuse a
 # stale bbox. Hash kept short — collisions don't matter, just uniqueness within one machine.
 def _cache_path_for(origin: str, dest: str) -> Path:
-    # `v2` bump: framing/tier logic + payload shape changed; old caches are stale by both.
-    key = hashlib.sha1(f"{origin}→{dest}|simplify={SIMPLIFY_GRAPH}|v2".encode()).hexdigest()[:12]
+    # `v3` bump: now SCC-pruned at fetch time; older caches contain the un-pruned graph
+    # which breaks A* on motorway-only continental routes (origin snaps into a 5-node
+    # dead-end ramp pocket).
+    key = hashlib.sha1(f"{origin}→{dest}|simplify={SIMPLIFY_GRAPH}|v3".encode()).hexdigest()[:12]
     return Path(f".graph_cache_{key}.pkl")
 
 CACHE_PATH: Path = Path()  # set in main()
@@ -302,7 +304,8 @@ def _patch_osmnx_observability(expected_chunks: int) -> None:
         before = len(G.nodes)
         t0 = time.time()
         result = original_largest(G, *args, **kwargs)
-        print(f"[osm] largest connected component: kept {len(result.nodes):,} of {before:,} nodes in {time.time()-t0:.1f}s", flush=True)
+        kind = "strongly" if kwargs.get("strongly") else "weakly"
+        print(f"[osm] largest {kind}-connected component: kept {len(result.nodes):,} of {before:,} nodes in {time.time()-t0:.1f}s", flush=True)
         return result
 
     _t.largest_component = wrapped_largest
@@ -431,6 +434,18 @@ def load_graph(o_lat: float, o_lon: float, d_lat: float, d_lon: float):
         **tier.osmnx_kwargs,
     )
     print(f"[osm] graph_from_bbox total: {time.time()-t0:.1f}s  →  {len(G.nodes):,} nodes, {len(G.edges):,} edges")
+
+    # osmnx's built-in largest_component is WEAKLY connected only — it treats the graph as
+    # undirected. Fine for dense `drive` networks (residential streets form return paths),
+    # but disastrous for motorway-only continental fetches: dual-carriageway interstates
+    # have eastbound and westbound as separate ways/nodes, and the only links between them
+    # are interchange ramps. Many one-way ramps and truncated boundary segments end up as
+    # tiny isolated SCCs (~1.6M of them on LA→NYC). nearest_nodes happily snaps origin into
+    # a 5-node dead-end pocket and A* fails with "no path found". Pruning to the largest
+    # STRONGLY-connected component guarantees a directed route exists between any pair of
+    # remaining nodes. Cheap on small graphs (≈no-op for `drive`), ~25s on continental
+    # motorway. We drop nodes that weren't useful for through-routing anyway.
+    G = ox.truncate.largest_component(G, strongly=True)
 
     # UTM is accurate inside one ~600 km zone but distorts badly across continental spans;
     # switch to Web Mercator once the bbox is wider than that. Web Mercator stretches the

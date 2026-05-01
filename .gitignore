@@ -1,0 +1,19 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+
+# OSM graph cache (project-local, regenerated per-route on first run)
+.graph_cache_*.pkl
+
+# osmnx HTTP response cache
+cache/
+
+# Render outputs (kept locally; not pushed to GitHub)
+*.mp4
+
+# Render logs
+render*.log
+
+# OS junk
+.DS_Store

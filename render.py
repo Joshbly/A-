@@ -24,6 +24,7 @@ import time
 from dataclasses import dataclass
 from heapq import heappush, heappop
 from pathlib import Path
+from typing import NamedTuple
 
 import cairo
 import cv2
@@ -36,6 +37,14 @@ import networkx as nx
 # Set both to "" to require explicit CLI args every run.
 DEFAULT_ORIGIN = "10 Post Office Square, Boston, MA 02109"
 DEFAULT_DEST   = "2 Leighton Street, Cambridge, MA 02141"
+
+# OSM Overpass API politeness. As of 2026-04 overpass-api.de bans requests using generic
+# User-Agent strings (osmnx's default trips this) — symptom is HTTP 406 Not Acceptable.
+# Set a unique identifier with contact info per OSM's usage policy:
+#   https://operations.osmfoundation.org/policies/api/
+# Edit if you want your name/email here so the OSM admins can reach you if needed.
+OVERPASS_USER_AGENT = "astar-cinematic-render/1.0 (personal viz; contact via github)"
+OVERPASS_REFERER    = "https://github.com/"
 
 # Resolved at startup from defaults or CLI args.
 ORIGIN_ADDR: str = ""
@@ -99,7 +108,8 @@ SIMPLIFY_GRAPH = False   # False → keep every OSM node; slower render but catc
 # Graph cache is keyed on the origin/dest pair so switching routes doesn't silently reuse a
 # stale bbox. Hash kept short — collisions don't matter, just uniqueness within one machine.
 def _cache_path_for(origin: str, dest: str) -> Path:
-    key = hashlib.sha1(f"{origin}→{dest}|simplify={SIMPLIFY_GRAPH}".encode()).hexdigest()[:12]
+    # `v2` bump: framing/tier logic + payload shape changed; old caches are stale by both.
+    key = hashlib.sha1(f"{origin}→{dest}|simplify={SIMPLIFY_GRAPH}|v2".encode()).hexdigest()[:12]
     return Path(f".graph_cache_{key}.pkl")
 
 CACHE_PATH: Path = Path()  # set in main()
@@ -144,12 +154,187 @@ def geocode_or_die(addr: str, label: str) -> tuple[float, float]:
     print(f"[geocode] {label}: {addr!r} → ({lat:.5f}, {lon:.5f})")
     return lat, lon
 
-# bbox auto-framing: padding is proportional to the route span so a cross-town 2-mile hop and
-# a 30-mile suburb-to-city trip both get a sensible amount of surrounding context. Values are
-# in degrees; the orthogonal floors keep near-axis-aligned routes from rendering as a sliver.
-PAD_MIN       = 0.012   # ~1.3 km floor — short urban routes still have breathing room
-PAD_FRAC      = 0.35    # fraction of route span added to each side of the dominant axis
-PAD_ORTHO_FRAC = 0.18   # minimum breathing room on the short axis, tied to the long axis span
+# bbox auto-framing.
+#
+# Calibrated against the original Chicago wide HQ render. That route had span 0.29° lat × 0.07°
+# lon and was hand-padded to (+0.04°, +0.16°) — i.e. ~14% of the long axis on each side, with the
+# short axis blown out to bring the framed aspect to ~1.3:1. The same two parameters reproduce
+# Chicago exactly and give a consistent feel across any route size:
+#   - PAD_FRAC: percent of route span padded on each side of the dominant axis
+#   - TARGET_MAX_ASPECT: cap on the framed bbox aspect ratio (long/short); short axis expands
+#     to fill the rest, which is what gives narrow N-S routes their generous metro context.
+# This is also how percent-padding stays meaningful at any scale: NYC→LA gets a continental
+# letterbox at the same aspect, not 600 km of empty Mexico/Canada padded as a fixed degree count.
+PAD_FRAC          = 0.14
+TARGET_MAX_ASPECT = 1.3
+PAD_MIN_KM        = 1.5    # absolute floor on each side — keeps cross-the-street trips legible
+
+M_PER_DEG_LAT = 110_540.0   # WGS84 mean — good enough for visualization framing
+
+
+# Adaptive road detail.
+#
+# At 1920px the screen has a fixed pixel budget regardless of bbox size, so a continental
+# render that fetches every alley would cost millions of edges and look like static. Tiers
+# drop progressively-less-important OSM road classes as bbox area grows, keeping edge density
+# per pixel roughly constant — and rendering time bounded — across 7 orders of magnitude.
+#
+# Width scales up as we trim, so motorway-only continental renders aren't a hairline. The
+# tier_seam below the threshold uses tier N's filter; one km² past it uses tier N+1's filter
+# (and slightly fatter strokes). Visually the seam is invisible because no single render
+# spans two tiers — only the population of renders does.
+#
+# overpass_chunk_km² controls how aggressively osmnx slices the bbox into sub-queries against
+# the public Overpass API. Default is 2500 km² which is correct for "drive (full)" (dense
+# data → conservative chunks), but devastating for sparse tiers — a continental motorway-only
+# fetch at the default cap would be ~7,700 sequential HTTP calls instead of ~10. Cap scales
+# inversely with the tier's expected result density, so each chunk returns a similar amount
+# of data regardless of how zoomed-out we are.
+def _filter_for(*levels: str) -> str:
+    """Build an Overpass `["highway"~"a|b|..."]` filter, auto-including `_link` variants
+    for the major hierarchy levels (so e.g. dropping primary also drops primary_link)."""
+    parts: list[str] = []
+    for lvl in levels:
+        parts.append(lvl)
+        if lvl in ("motorway", "trunk", "primary", "secondary", "tertiary"):
+            parts.append(f"{lvl}_link")
+    return f'["highway"~"{"|".join(parts)}"]'
+
+
+class RoadTier(NamedTuple):
+    max_area_km2: float          # tier selected if framed bbox area ≤ this
+    osmnx_kwargs: dict           # passed to ox.graph_from_bbox; either network_type or custom_filter
+    label: str                   # human-readable tier name (printed at startup)
+    width_scale: float           # multiplier on ROAD_WIDTH/PATH_WIDTH so coarser maps stay legible
+    overpass_chunk_km2: float    # max km² per Overpass sub-query (osmnx max_query_area_size)
+    overpass_timeout_s: int      # per-request HTTP timeout (osmnx requests_timeout)
+
+
+ROAD_TIERS: list[RoadTier] = [
+    RoadTier(    2_500, {"network_type": "drive"},                                                                "drive (full)", 1.00,     2_500, 180),
+    RoadTier(   10_000, {"custom_filter": _filter_for("motorway", "trunk", "primary", "secondary", "tertiary",
+                                                      "unclassified", "residential")},                           "no service",   1.05,     5_000, 240),
+    RoadTier(   40_000, {"custom_filter": _filter_for("motorway", "trunk", "primary", "secondary", "tertiary")}, "tertiary+",    1.20,    15_000, 240),
+    RoadTier(  150_000, {"custom_filter": _filter_for("motorway", "trunk", "primary", "secondary")},             "secondary+",   1.40,    50_000, 300),
+    RoadTier(  600_000, {"custom_filter": _filter_for("motorway", "trunk", "primary")},                          "primary+",     1.70,   200_000, 300),
+    RoadTier(3_000_000, {"custom_filter": _filter_for("motorway", "trunk")},                                     "trunk+",       2.20,   600_000, 300),
+    RoadTier(math.inf,  {"custom_filter": _filter_for("motorway")},                                              "interstates",  2.90, 2_000_000, 300),
+]
+
+
+def select_tier(area_km2: float) -> RoadTier:
+    for tier in ROAD_TIERS:
+        if area_km2 <= tier.max_area_km2:
+            return tier
+    raise RuntimeError("unreachable")
+
+
+def _patch_osmnx_observability(expected_chunks: int) -> None:
+    """Wrap multiple osmnx internals so the silent post-fetch phase prints status.
+
+    A bare osmnx fetch on a continental route looks like:
+        - 12-15 chunks download in seconds (silent for fast queries / cache hits)
+        - parses 5M+ JSON elements (1-2 min, silent)
+        - builds NetworkX graph (1-2 min, silent)
+        - truncates to bbox polygon (~30s, silent)
+        - finds largest connected component (1-3 min, silent — the worst offender)
+    Total can be 5-10+ minutes of dead air after the chunk lines stop. This wraps each
+    phase so it prints a status line. The chunk estimate is rough — osmnx subdivides on
+    a projected-meters grid, and continental UTM distortion makes the actual count run
+    a few past our km-based estimate (hence the leading ~)."""
+    from osmnx import _overpass
+    from osmnx import graph as _g
+    from osmnx import truncate as _t
+
+    # 1. per-chunk Overpass downloads
+    original_req = _overpass._overpass_request
+    state = {"i": 0, "t0": time.time()}
+
+    def wrapped_req(data):
+        state["i"] += 1
+        i = state["i"]
+        chunk_t0 = time.time()
+        print(f"[osm]   chunk {i:>2}/~{expected_chunks}: POST…", flush=True)
+        try:
+            result = original_req(data)
+        except Exception as exc:
+            print(f"[osm]   chunk {i:>2}/~{expected_chunks}: failed after {time.time()-chunk_t0:.0f}s ({type(exc).__name__})", flush=True)
+            raise
+        dt      = time.time() - chunk_t0
+        elapsed = time.time() - state["t0"]
+        n_elem  = len(result.get("elements", [])) if isinstance(result, dict) else 0
+        print(f"[osm]   chunk {i:>2}/~{expected_chunks}: ok in {dt:.0f}s, {n_elem:,} elements  (total {elapsed:.0f}s)", flush=True)
+        return result
+
+    _overpass._overpass_request = wrapped_req
+
+    # 2. graph build (parse JSON → NetworkX nodes/edges). Slowest single step for
+    #    continental routes — millions of element-dict lookups.
+    original_build = _g._create_graph
+
+    # _create_graph internally consumes the chunk generator (which triggers each POST), so
+    # any "starting" message would print before the chunks — only print after it returns.
+    def wrapped_build(*args, **kwargs):
+        t0 = time.time()
+        result = original_build(*args, **kwargs)
+        print(f"[osm] graph built: {len(result.nodes):,} nodes, {len(result.edges):,} edges in {time.time()-t0:.1f}s", flush=True)
+        return result
+
+    _g._create_graph = wrapped_build
+
+    # 3. polygon truncation + largest-component filter. `largest_component` is the
+    #    worst offender on continental graphs — does a weakly-connected-components scan
+    #    over hundreds of thousands of nodes.
+    original_trunc = _t.truncate_graph_polygon
+
+    def wrapped_trunc(G, polygon, *args, **kwargs):
+        before = len(G.nodes)
+        t0 = time.time()
+        result = original_trunc(G, polygon, *args, **kwargs)
+        print(f"[osm] truncated to bbox: {len(result.nodes):,} of {before:,} nodes in {time.time()-t0:.1f}s", flush=True)
+        return result
+
+    _t.truncate_graph_polygon = wrapped_trunc
+
+    original_largest = _t.largest_component
+
+    def wrapped_largest(G, *args, **kwargs):
+        before = len(G.nodes)
+        t0 = time.time()
+        result = original_largest(G, *args, **kwargs)
+        print(f"[osm] largest connected component: kept {len(result.nodes):,} of {before:,} nodes in {time.time()-t0:.1f}s", flush=True)
+        return result
+
+    _t.largest_component = wrapped_largest
+
+
+def compute_bbox(o_lat: float, o_lon: float, d_lat: float, d_lon: float):
+    """Frame the route in a Chicago-wide-HQ-equivalent bbox. Returns
+    (north, south, east, west, framed_w_km, framed_h_km)."""
+    mid_lat = (o_lat + d_lat) / 2
+    m_per_deg_lon = M_PER_DEG_LAT * math.cos(math.radians(mid_lat))
+
+    span_x_km = abs(o_lon - d_lon) * m_per_deg_lon / 1000.0
+    span_y_km = abs(o_lat - d_lat) * M_PER_DEG_LAT / 1000.0
+
+    W = max(span_x_km * (1 + 2 * PAD_FRAC), span_x_km + 2 * PAD_MIN_KM)
+    H = max(span_y_km * (1 + 2 * PAD_FRAC), span_y_km + 2 * PAD_MIN_KM)
+
+    if W > H * TARGET_MAX_ASPECT:
+        H = W / TARGET_MAX_ASPECT
+    elif H > W * TARGET_MAX_ASPECT:
+        W = H / TARGET_MAX_ASPECT
+
+    pad_x_km = (W - span_x_km) / 2
+    pad_y_km = (H - span_y_km) / 2
+    pad_lon  = pad_x_km * 1000.0 / m_per_deg_lon
+    pad_lat  = pad_y_km * 1000.0 / M_PER_DEG_LAT
+
+    north = max(o_lat, d_lat) + pad_lat
+    south = min(o_lat, d_lat) - pad_lat
+    east  = max(o_lon, d_lon) + pad_lon
+    west  = min(o_lon, d_lon) - pad_lon
+    return north, south, east, west, W, H
 
 # pacing: total video length in seconds for each phase
 SPREAD_SECONDS = 32      # exploration animation
@@ -201,6 +386,15 @@ def apply_profile(profile: RenderProfile) -> None:
     HOT_COOL_RATE = profile.hot_cool_per_sec ** (1.0 / profile.fps)
 
 
+def apply_tier_scale(scale: float) -> None:
+    """Inflate stroke widths to match the road tier we're rendering at — a continental
+    motorway-only graph at 1920px needs ~3× the stroke a downtown-grid render does, or it
+    disappears against the bloom. Called after load_graph (which picks the tier)."""
+    global ROAD_WIDTH, PATH_WIDTH
+    ROAD_WIDTH *= scale
+    PATH_WIDTH *= scale
+
+
 # ───────────────────────────── graph + A* ─────────────────────────────
 def load_graph(o_lat: float, o_lon: float, d_lat: float, d_lon: float):
     if CACHE_PATH.exists():
@@ -208,31 +402,48 @@ def load_graph(o_lat: float, o_lon: float, d_lat: float, d_lon: float):
         with open(CACHE_PATH, "rb") as f:
             return pickle.load(f)
 
-    span_lat = abs(o_lat - d_lat)
-    span_lon = abs(o_lon - d_lon)
-    pad_lat = max(PAD_MIN, span_lat * PAD_FRAC, span_lon * PAD_ORTHO_FRAC)
-    pad_lon = max(PAD_MIN, span_lon * PAD_FRAC, span_lat * PAD_ORTHO_FRAC)
-    print(f"[geo] route span  Δlat={span_lat:.4f}°  Δlon={span_lon:.4f}°  → pad=({pad_lat:.4f}°, {pad_lon:.4f}°)")
+    north, south, east, west, frame_w_km, frame_h_km = compute_bbox(o_lat, o_lon, d_lat, d_lon)
+    area_km2 = frame_w_km * frame_h_km
+    tier = select_tier(area_km2)
+    aspect = max(frame_w_km, frame_h_km) / min(frame_w_km, frame_h_km)
+    print(f"[frame] {frame_w_km:.1f} × {frame_h_km:.1f} km  (aspect {aspect:.2f}, area {area_km2:,.0f} km²)")
+    print(f"[frame] bbox  N{north:.4f}  S{south:.4f}  E{east:.4f}  W{west:.4f}")
+    print(f"[tier]  {tier.label}  →  road/path width × {tier.width_scale:.2f}")
 
-    north = max(o_lat, d_lat) + pad_lat
-    south = min(o_lat, d_lat) - pad_lat
-    east  = max(o_lon, d_lon) + pad_lon
-    west  = min(o_lon, d_lon) - pad_lon
+    # Tell osmnx to use bigger Overpass chunks for sparse tiers — see ROAD_TIERS comment.
+    # Without this a continental motorway-only fetch chunks into ~7,700 sequential requests;
+    # with it, ~12. We also bump the per-request timeout because bigger chunks mean Overpass
+    # spends more CPU per query (still well under its server-side limits for sparse data).
+    ox.settings.max_query_area_size = tier.overpass_chunk_km2 * 1e6
+    ox.settings.requests_timeout    = tier.overpass_timeout_s
+    # osmnx subdivides on a square grid with side = sqrt(chunk cap), not by area, so the real
+    # chunk count is ceil(W/side) * ceil(H/side) — slightly more than naive area÷cap.
+    quad_km = math.sqrt(tier.overpass_chunk_km2)
+    n_chunks = max(1, math.ceil(frame_w_km / quad_km)) * max(1, math.ceil(frame_h_km / quad_km))
+    print(f"[osm]   chunk cap {tier.overpass_chunk_km2:,} km²  →  ~{n_chunks} Overpass sub-quer{'y' if n_chunks == 1 else 'ies'}  (timeout {tier.overpass_timeout_s}s)")
 
-    print(f"[osm] fetching drive network for bbox N{north:.3f} S{south:.3f} E{east:.3f} W{west:.3f}…")
+    _patch_osmnx_observability(n_chunks)
     t0 = time.time()
     G = ox.graph_from_bbox(
         bbox=(west, south, east, north),
-        network_type="drive",
         simplify=SIMPLIFY_GRAPH,
         retain_all=False,
+        **tier.osmnx_kwargs,
     )
-    print(f"  fetched {len(G.nodes)} nodes, {len(G.edges)} edges in {time.time()-t0:.1f}s")
+    print(f"[osm] graph_from_bbox total: {time.time()-t0:.1f}s  →  {len(G.nodes):,} nodes, {len(G.edges):,} edges")
 
-    print("[osm] projecting to UTM…")
-    G = ox.project_graph(G)
+    # UTM is accurate inside one ~600 km zone but distorts badly across continental spans;
+    # switch to Web Mercator once the bbox is wider than that. Web Mercator stretches the
+    # poles but for sub-Arctic visualization it just looks like the familiar US/world map.
+    lon_span_deg = east - west
+    to_crs = "EPSG:3857" if lon_span_deg > 4.0 else None
+    t0 = time.time()
+    print(f"[osm] projecting to {'Web Mercator' if to_crs else 'UTM'}…", flush=True)
+    G = ox.project_graph(G, to_crs=to_crs)
+    print(f"[osm] projected in {time.time()-t0:.1f}s", flush=True)
 
-    print("[osm] annotating edges with speed + travel_time…")
+    t0 = time.time()
+    print("[osm] annotating edges with speed + travel_time…", flush=True)
     G = ox.add_edge_speeds(G)
 
     # Manual correction: OSM has Chicago motorways tagged conservatively (many at 55 mph).
@@ -254,11 +465,12 @@ def load_graph(o_lat: float, o_lon: float, d_lat: float, d_lon: float):
         elif hwy == "motorway_link":
             data["speed_kph"] = MOTORWAY_LINK_KPH
             n_link += 1
-    print(f"  set {n_mw} motorway edges → 75 mph, {n_link} motorway_link edges → 55 mph")
 
     G = ox.add_edge_travel_times(G)
+    print(f"[osm] annotated in {time.time()-t0:.1f}s ({n_mw:,} motorway, {n_link:,} motorway_link overrides)", flush=True)
 
-    # project query points into the same CRS so nearest_nodes works on projected graph
+    t0 = time.time()
+    print("[osm] snapping origin/dest to nearest graph nodes…", flush=True)
     import geopandas as gpd
     from shapely.geometry import Point
     pts = gpd.GeoDataFrame(
@@ -267,12 +479,11 @@ def load_graph(o_lat: float, o_lon: float, d_lat: float, d_lon: float):
     ).to_crs(G.graph["crs"])
     o_x, o_y = pts.geometry.iloc[0].x, pts.geometry.iloc[0].y
     d_x, d_y = pts.geometry.iloc[1].x, pts.geometry.iloc[1].y
-
     origin_node = ox.distance.nearest_nodes(G, X=o_x, Y=o_y)
     dest_node   = ox.distance.nearest_nodes(G, X=d_x, Y=d_y)
-    print(f"  origin node {origin_node}  dest node {dest_node}")
+    print(f"[osm] origin → node {origin_node}, dest → node {dest_node}  ({time.time()-t0:.1f}s)", flush=True)
 
-    payload = (G, origin_node, dest_node)
+    payload = (G, origin_node, dest_node, tier.width_scale)
     with open(CACHE_PATH, "wb") as f:
         pickle.dump(payload, f)
     return payload
@@ -420,9 +631,10 @@ def draw_edge_geom(ctx: cairo.Context, edge_data, u_xy, v_xy, proj: Projector):
 # ───────────────────────────── render ─────────────────────────────
 def render_video(o_lat: float, o_lon: float, d_lat: float, d_lon: float):
     global WIDTH, HEIGHT
-    G, origin_node, dest_node = load_graph(o_lat, o_lon, d_lat, d_lon)
+    G, origin_node, dest_node, width_scale = load_graph(o_lat, o_lon, d_lat, d_lon)
+    apply_tier_scale(width_scale)
     WIDTH, HEIGHT, proj = build_projector(G)
-    print(f"[render] canvas: {WIDTH}×{HEIGHT}")
+    print(f"[render] canvas: {WIDTH}×{HEIGHT}  road/path widths: {ROAD_WIDTH:.2f}/{PATH_WIDTH:.2f}px")
 
     print("[astar] running A*…")
     t0 = time.time()
@@ -700,6 +912,12 @@ def main():
         parser.error(
             "missing addresses — pass them on the CLI, or set DEFAULT_ORIGIN/DEFAULT_DEST at the top of render.py"
         )
+
+    # Identify ourselves to OSM/Overpass before any HTTP traffic — see comment on the
+    # OVERPASS_USER_AGENT constant. Without this, overpass-api.de's abuse rules return
+    # HTTP 406 for sparse-tier (continental) queries.
+    ox.settings.http_user_agent = OVERPASS_USER_AGENT
+    ox.settings.http_referer    = OVERPASS_REFERER
 
     ORIGIN_ADDR = args.origin
     DEST_ADDR   = args.dest

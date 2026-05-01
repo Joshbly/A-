@@ -1,7 +1,14 @@
 """
 A* pathfinding visualizer → cinematic MP4.
-Wilmette → SW Chicago, rendered with multi-radius bloom, age-faded trails,
-white-hot frontier, and a final glowing path reveal.
+
+Geocodes any origin/destination pair, auto-frames the bounding box around the route,
+and renders multi-radius bloom, age-faded trails, white-hot frontier, and a final
+glowing path reveal.
+
+Usage:
+    python render.py "10 Post Office Square, Boston, MA" "2 Leighton St, Cambridge, MA"
+    python render.py "<origin>" "<dest>" --hq           # 1440p / 120 fps
+    python render.py "<origin>" "<dest>" --out my.mp4   # override output path
 """
 from __future__ import annotations
 
@@ -10,6 +17,7 @@ import hashlib
 import math
 import os
 import pickle
+import re
 import subprocess
 import sys
 import time
@@ -24,8 +32,14 @@ import osmnx as ox
 import networkx as nx
 
 # ───────────────────────────── config ─────────────────────────────
-ORIGIN_ADDR = "10 Post Office Square, Boston, MA 02109"
-DEST_ADDR   = "2 Leighton Street, Cambridge, MA 02141"
+# Edit these for the no-args path (`python render.py`). CLI positional args override.
+# Set both to "" to require explicit CLI args every run.
+DEFAULT_ORIGIN = "10 Post Office Square, Boston, MA 02109"
+DEFAULT_DEST   = "2 Leighton Street, Cambridge, MA 02141"
+
+# Resolved at startup from defaults or CLI args.
+ORIGIN_ADDR: str = ""
+DEST_ADDR:   str = ""
 
 # ── render profiles ──────────────────────────────────────────────────────────────────
 # Two presets: SD (canonical 1920-bounded, 30 fps) and HQ (2560-bounded, 120 fps).
@@ -47,7 +61,7 @@ SD_PROFILE = RenderProfile(
     name="sd",
     max_dim=1920,
     fps=30,
-    out_path=Path("boston_astar_wide.mp4"),
+    out_path=Path(""),             # filled in at runtime from origin/dest slugs
     crf=16,
     preset="medium",
     hot_cool_per_sec=0.88 ** 30,   # preserves the existing look at 30 fps
@@ -57,7 +71,7 @@ HQ_PROFILE = RenderProfile(
     name="hq",
     max_dim=2560,                  # 1440p on the long side
     fps=120,
-    out_path=Path("boston_astar_wide_hq.mp4"),
+    out_path=Path(""),
     crf=15,
     preset="slow",                 # worth the extra encode time given 4× the frames
     hot_cool_per_sec=0.88 ** 30,   # identical wall-clock cooling
@@ -88,7 +102,47 @@ def _cache_path_for(origin: str, dest: str) -> Path:
     key = hashlib.sha1(f"{origin}→{dest}|simplify={SIMPLIFY_GRAPH}".encode()).hexdigest()[:12]
     return Path(f".graph_cache_{key}.pkl")
 
-CACHE_PATH = _cache_path_for(ORIGIN_ADDR, DEST_ADDR)
+CACHE_PATH: Path = Path()  # set in main()
+
+
+def _slug(addr: str, max_len: int = 20) -> str:
+    """Filename-friendly slug from an address. Tries street+city first; if that's too long,
+    falls back to just the city (last comma-delimited segment we kept)."""
+    parts = [p.strip() for p in addr.split(",")][:2]  # street, city — drop state/zip/country
+    cleaned = " ".join(parts).lower()
+    cleaned = re.sub(r"\b(suite|ste|apt|unit|fl|floor|rm|room)\s*\w+", "", cleaned)
+    cleaned = re.sub(r"#\s*\w+", "", cleaned)
+    cleaned = re.sub(r"[^a-z0-9]+", "_", cleaned).strip("_")
+    if cleaned and len(cleaned) <= max_len:
+        return cleaned
+    city = parts[-1] if len(parts) > 1 else parts[0]
+    city = re.sub(r"[^a-z0-9]+", "_", city.lower()).strip("_")
+    return (city[:max_len].rstrip("_") or "loc")
+
+
+def _default_out_path(origin: str, dest: str, hq: bool) -> Path:
+    """Build a readable output filename from the two addresses, e.g. boston_to_cambridge.mp4."""
+    suffix = "_hq" if hq else ""
+    return Path(f"{_slug(origin)}_to_{_slug(dest)}_astar{suffix}.mp4")
+
+
+def geocode_or_die(addr: str, label: str) -> tuple[float, float]:
+    """Geocode `addr` or exit immediately with a useful message. Run upfront on every
+    invocation so a typo'd address fails in ~1 second instead of after graph load."""
+    try:
+        lat, lon = ox.geocode(addr)
+    except Exception as e:
+        print(f"\n[geocode error] could not resolve {label} address:", file=sys.stderr)
+        print(f"  {addr!r}", file=sys.stderr)
+        print(f"  → {type(e).__name__}: {e}", file=sys.stderr)
+        print(
+            "\nTry dropping suite/unit numbers or country, or simplify to "
+            "'street, city, state'. Nominatim is picky.\n",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+    print(f"[geocode] {label}: {addr!r} → ({lat:.5f}, {lon:.5f})")
+    return lat, lon
 
 # bbox auto-framing: padding is proportional to the route span so a cross-town 2-mile hop and
 # a 30-mile suburb-to-city trip both get a sensible amount of surrounding context. Values are
@@ -148,17 +202,11 @@ def apply_profile(profile: RenderProfile) -> None:
 
 
 # ───────────────────────────── graph + A* ─────────────────────────────
-def load_graph():
+def load_graph(o_lat: float, o_lon: float, d_lat: float, d_lon: float):
     if CACHE_PATH.exists():
         print(f"[graph] loading cache {CACHE_PATH}")
         with open(CACHE_PATH, "rb") as f:
             return pickle.load(f)
-
-    print("[geo] geocoding addresses…")
-    o_lat, o_lon = ox.geocode(ORIGIN_ADDR)
-    d_lat, d_lon = ox.geocode(DEST_ADDR)
-    print(f"  origin = ({o_lat:.5f}, {o_lon:.5f})")
-    print(f"  dest   = ({d_lat:.5f}, {d_lon:.5f})")
 
     span_lat = abs(o_lat - d_lat)
     span_lon = abs(o_lon - d_lon)
@@ -370,9 +418,9 @@ def draw_edge_geom(ctx: cairo.Context, edge_data, u_xy, v_xy, proj: Projector):
 
 
 # ───────────────────────────── render ─────────────────────────────
-def render_video():
+def render_video(o_lat: float, o_lon: float, d_lat: float, d_lon: float):
     global WIDTH, HEIGHT
-    G, origin_node, dest_node = load_graph()
+    G, origin_node, dest_node = load_graph(o_lat, o_lon, d_lat, d_lon)
     WIDTH, HEIGHT, proj = build_projector(G)
     print(f"[render] canvas: {WIDTH}×{HEIGHT}")
 
@@ -626,13 +674,50 @@ def render_video():
     print(f"[done] wrote {OUT_PATH} ({total_frames} frames @ {FPS}fps)")
 
 
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="A* pathfinding visualizer → MP4")
-    parser.add_argument(
-        "--hq", action="store_true",
-        help="render the 1440p-bounded / 120 fps HQ version to chicago_astar_wide_hq.mp4",
+def main():
+    global ORIGIN_ADDR, DEST_ADDR, CACHE_PATH, OUT_PATH
+
+    parser = argparse.ArgumentParser(
+        description="A* pathfinding visualizer → cinematic MP4",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=(
+            "examples:\n"
+            "  python render.py '10 Post Office Square, Boston, MA' '2 Leighton St, Cambridge, MA'\n"
+            "  python render.py 'Logan Airport, Boston, MA' 'Fenway Park, Boston, MA' --hq\n"
+        ),
     )
+    parser.add_argument("origin", nargs="?", default=DEFAULT_ORIGIN,
+                        help=f"origin address (default from DEFAULT_ORIGIN: {DEFAULT_ORIGIN!r})")
+    parser.add_argument("dest", nargs="?", default=DEFAULT_DEST,
+                        help=f"destination address (default from DEFAULT_DEST: {DEFAULT_DEST!r})")
+    parser.add_argument("--hq", action="store_true",
+                        help="render the 1440p-bounded / 120 fps HQ version (slower, much sharper)")
+    parser.add_argument("--out", type=Path, default=None,
+                        help="override output filename (default: <origin>_to_<dest>_astar[_hq].mp4)")
     args = parser.parse_args()
+
+    if not args.origin or not args.dest:
+        parser.error(
+            "missing addresses — pass them on the CLI, or set DEFAULT_ORIGIN/DEFAULT_DEST at the top of render.py"
+        )
+
+    ORIGIN_ADDR = args.origin
+    DEST_ADDR   = args.dest
+
+    # validate both addresses upfront — surface geocoding errors before any expensive work
+    print("[geocode] validating addresses…", flush=True)
+    o_lat, o_lon = geocode_or_die(args.origin, "origin")
+    d_lat, d_lon = geocode_or_die(args.dest,   "dest")
+
     apply_profile(HQ_PROFILE if args.hq else SD_PROFILE)
+    OUT_PATH = args.out if args.out is not None else _default_out_path(args.origin, args.dest, hq=args.hq)
+    CACHE_PATH = _cache_path_for(args.origin, args.dest)
+
     print(f"[profile] {PROFILE.name}: long side {MAX_DIM}px @ {FPS} fps → {OUT_PATH}")
-    render_video()
+    print(f"[cache]   {CACHE_PATH}")
+
+    render_video(o_lat, o_lon, d_lat, d_lon)
+
+
+if __name__ == "__main__":
+    main()

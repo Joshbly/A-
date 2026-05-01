@@ -13,6 +13,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import bisect
 import hashlib
 import math
 import os
@@ -213,14 +214,21 @@ class RoadTier(NamedTuple):
 
 
 ROAD_TIERS: list[RoadTier] = [
+    # width_scale dialed down from the original 1.00→2.90 ramp. The thinnest tier is
+    # unchanged (Chicago wide HQ baseline). Coarser tiers needed *some* thickening so a
+    # ~1px line at continental zoom doesn't antialias to invisibility, but the original
+    # multiplier was overshooting — at 2.90× and HQ canvas (k=1.33) PATH_WIDTH hit 9px,
+    # which combined with full bloom kernels produced a chunky, overprocessed feel
+    # disproportionate to the actual road footprint. New ramp keeps continental strokes
+    # legible while preserving the small-scale aesthetic the user likes.
     RoadTier(    2_500, {"network_type": "drive"},                                                                "drive (full)", 1.00,     2_500, 180),
     RoadTier(   10_000, {"custom_filter": _filter_for("motorway", "trunk", "primary", "secondary", "tertiary",
-                                                      "unclassified", "residential")},                           "no service",   1.05,     5_000, 240),
-    RoadTier(   40_000, {"custom_filter": _filter_for("motorway", "trunk", "primary", "secondary", "tertiary")}, "tertiary+",    1.20,    15_000, 240),
-    RoadTier(  150_000, {"custom_filter": _filter_for("motorway", "trunk", "primary", "secondary")},             "secondary+",   1.40,    50_000, 300),
-    RoadTier(  600_000, {"custom_filter": _filter_for("motorway", "trunk", "primary")},                          "primary+",     1.70,   200_000, 300),
-    RoadTier(3_000_000, {"custom_filter": _filter_for("motorway", "trunk")},                                     "trunk+",       2.20,   600_000, 300),
-    RoadTier(math.inf,  {"custom_filter": _filter_for("motorway")},                                              "interstates",  2.90, 2_000_000, 300),
+                                                      "unclassified", "residential")},                           "no service",   1.00,     5_000, 240),
+    RoadTier(   40_000, {"custom_filter": _filter_for("motorway", "trunk", "primary", "secondary", "tertiary")}, "tertiary+",    1.05,    15_000, 240),
+    RoadTier(  150_000, {"custom_filter": _filter_for("motorway", "trunk", "primary", "secondary")},             "secondary+",   1.15,    50_000, 300),
+    RoadTier(  600_000, {"custom_filter": _filter_for("motorway", "trunk", "primary")},                          "primary+",     1.30,   200_000, 300),
+    RoadTier(3_000_000, {"custom_filter": _filter_for("motorway", "trunk")},                                     "trunk+",       1.45,   600_000, 300),
+    RoadTier(math.inf,  {"custom_filter": _filter_for("motorway")},                                              "interstates",  1.65, 2_000_000, 300),
 ]
 
 
@@ -391,11 +399,18 @@ def apply_profile(profile: RenderProfile) -> None:
 
 def apply_tier_scale(scale: float) -> None:
     """Inflate stroke widths to match the road tier we're rendering at — a continental
-    motorway-only graph at 1920px needs ~3× the stroke a downtown-grid render does, or it
-    disappears against the bloom. Called after load_graph (which picks the tier)."""
+    motorway-only graph at 1920px would otherwise antialias to invisibility — and damp the
+    bloom proportionally so the wider strokes don't compound into a chunky, over-haloed
+    look at continental zoom. sqrt fall-off on bloom: drive (scale=1.00) is unchanged,
+    interstates (scale=1.65) drop to ~78% bloom intensity. Called after load_graph picks
+    the tier."""
     global ROAD_WIDTH, PATH_WIDTH
     ROAD_WIDTH *= scale
     PATH_WIDTH *= scale
+
+    bloom_atten = 1.0 / math.sqrt(scale)
+    for i in range(len(BLOOM_WEIGHTS)):
+        BLOOM_WEIGHTS[i] *= bloom_atten
 
 
 # ───────────────────────────── graph + A* ─────────────────────────────
@@ -687,7 +702,15 @@ def render_video(o_lat: float, o_lon: float, d_lat: float, d_lon: float):
             pts = [proj(ux, uy), proj(vx, vy)]
         edge_polylines[(u, v)] = pts
 
-    # ── pacing schedule (ease in-out cubic) ─────────────────────────────
+    # ── pacing schedule (geographic distance, cubic ease in-out) ───────
+    # Pace by how far A*'s frontier has reached from origin, NOT by how many edges it has
+    # relaxed. Edge density per km is wildly non-uniform — dense in metros, sparse in rural —
+    # so edge-count pacing makes the visualization dwell in cities for many seconds before
+    # "shooting" across the open country. Distance pacing makes the frontier velocity feel
+    # uniform: dense metro exploration compresses (because frontier barely advances during
+    # interchange relaxation), open-highway segments take their fair share of screen time.
+    # A per-frame burst cap prevents sudden geographic jumps (entering/leaving a metro) from
+    # dumping hundreds of edges into one frame; bursts spread across a few frames instead.
     spread_frames = int(SPREAD_SECONDS * FPS)
     path_frames   = int(PATH_SECONDS * FPS)
     hold_frames   = int(HOLD_SECONDS * FPS)
@@ -696,7 +719,35 @@ def render_video(o_lat: float, o_lon: float, d_lat: float, d_lon: float):
     total_edges = len(explored)
     def ease(t):  # cubic in-out
         return 3 * t * t - 2 * t * t * t
-    edge_cumulative = [int(ease((i + 1) / spread_frames) * total_edges) for i in range(spread_frames)]
+
+    # Frontier reach = max distance-from-origin among edge endpoints relaxed so far.
+    # Monotonically non-decreasing by construction → bisect works.
+    o_x = G.nodes[origin_node]["x"]
+    o_y = G.nodes[origin_node]["y"]
+    frontier_dist: list[float] = []
+    running_max = 0.0
+    for u, v in explored:
+        nx_, ny_ = G.nodes[v]["x"], G.nodes[v]["y"]
+        d = math.hypot(nx_ - o_x, ny_ - o_y)
+        if d > running_max:
+            running_max = d
+        frontier_dist.append(running_max)
+    max_reach = frontier_dist[-1] if frontier_dist else 1.0
+
+    # Burst cap = ~3× average edge rate. Steady-state pacing unaffected; only kicks in on
+    # sudden frontier jumps (e.g. transitioning from LA metro out onto open I-10 East,
+    # where one geographic step suddenly "unlocks" a thousand edges of metro relaxation).
+    avg_per_frame = max(1, total_edges // max(spread_frames, 1))
+    max_per_frame = max(20, 3 * avg_per_frame)
+
+    edge_cumulative: list[int] = []
+    idx = 0
+    for i in range(spread_frames):
+        target_dist = ease((i + 1) / spread_frames) * max_reach
+        geo_target  = bisect.bisect_right(frontier_dist, target_dist)
+        capped      = min(geo_target, idx + max_per_frame, total_edges)
+        edge_cumulative.append(capped)
+        idx = capped
     edge_cumulative[-1] = total_edges
 
     # ── ffmpeg pipe ─────────────────────────────────────────────────────
@@ -866,21 +917,103 @@ def render_video(o_lat: float, o_lon: float, d_lat: float, d_lon: float):
             print(f"  frame {i+1}/{spread_frames}  edges {idx}/{total_edges}  {elapsed:.1f}s", flush=True)
 
     # ── phase 2: path reveal ────────────────────────────────────────────
-    # The path stroke grows over time; rather than restroking from scratch each frame, we track
-    # how many edges are newly visible and only stroke those, then max-merge into path_buffer.
+    # Treat the path as ONE continuous polyline in pixel space, not as a sequence of
+    # discrete edges. The bug in the old length-based-edge approach: even with
+    # length-aware pacing, an edge was still rendered atomically — so a 50 km motorway
+    # segment sat invisible for ~500 frames while pacing accumulated, then popped in
+    # fully on the single frame that crossed its threshold. That pop is what reads as
+    # "buzzing/zapping" on long highway routes.
+    #
+    # Real fix: concatenate edge polylines into one big polyline, compute cumulative
+    # PIXEL arc length, and per-frame stroke the partial sub-polyline from prev_arc to
+    # new_arc — interpolating exactly into the segments the arc-positions land in.
+    # Each frame's new stroke is a tiny pixel-length stub; over `path_frames` frames the
+    # tip moves at constant pixel velocity (modulo ease). Edge boundaries become
+    # invisible because we routinely start mid-edge and end mid-edge.
     print(f"[render] phase 2: path reveal ({path_frames} frames)", flush=True)
     path_edges = list(zip(path[:-1], path[1:]))
-    last_revealed = 0
+    full_path_pts: list[tuple[float, float]] = []
+    for u, v in path_edges:
+        pts = edge_polylines.get((u, v))
+        if not pts:
+            continue
+        if not full_path_pts:
+            full_path_pts.extend(pts)
+        else:
+            # Each edge's first point duplicates the previous edge's last point — skip it
+            full_path_pts.extend(pts[1:])
+
+    # seg_cum[i] = cumulative pixel arc length at point i+1. By construction monotonic
+    # increasing, so bisect is correct.
+    seg_cum: list[float] = []
+    total_arc = 0.0
+    for i in range(1, len(full_path_pts)):
+        px0, py0 = full_path_pts[i - 1]
+        px1, py1 = full_path_pts[i]
+        total_arc += math.hypot(px1 - px0, py1 - py0)
+        seg_cum.append(total_arc)
+
+    def _arc_subsegment(arc_a: float, arc_b: float) -> list[tuple[float, float]]:
+        """Polyline points between arc lengths a and b along full_path_pts. Endpoints
+        are interpolated into the containing segments; intermediate vertices are passed
+        through unchanged so straight runs stay perfectly straight."""
+        if arc_b <= arc_a or not seg_cum:
+            return []
+        arc_a = max(0.0, arc_a)
+        arc_b = min(total_arc, arc_b)
+        n_seg = len(seg_cum)
+        a_seg = min(bisect.bisect_left(seg_cum, arc_a), n_seg - 1)
+        b_seg = min(bisect.bisect_left(seg_cum, arc_b), n_seg - 1)
+
+        def _interp(seg_i: int, arc_pos: float) -> tuple[float, float]:
+            seg_start = seg_cum[seg_i - 1] if seg_i > 0 else 0.0
+            seg_len   = seg_cum[seg_i] - seg_start
+            t = (arc_pos - seg_start) / seg_len if seg_len > 0 else 0.0
+            x0, y0 = full_path_pts[seg_i]
+            x1, y1 = full_path_pts[seg_i + 1]
+            return (x0 + t * (x1 - x0), y0 + t * (y1 - y0))
+
+        out_pts = [_interp(a_seg, arc_a)]
+        for i in range(a_seg + 1, b_seg + 1):
+            out_pts.append(full_path_pts[i])
+        out_pts.append(_interp(b_seg, arc_b))
+        return out_pts
+
+    prev_arc = 0.0
     for i in range(path_frames):
         frac = (i + 1) / path_frames
-        frac_eased = 1 - (1 - frac) ** 2
-        n_reveal = max(1, int(frac_eased * len(path_edges)))
-        new_path_edges = path_edges[last_revealed:n_reveal]
-        last_revealed = n_reveal
+        frac_eased = 1 - (1 - frac) ** 2  # ease-out quad
+        new_arc = frac_eased * total_arc
 
-        if new_path_edges:
-            mask, _ = stroke_edges_alpha(new_path_edges, PATH_WIDTH)
+        sub_pts = _arc_subsegment(prev_arc, new_arc) if total_arc > 0 else []
+
+        if len(sub_pts) >= 2:
+            # Clear last frame's dirty rect (or the whole scratch on entry from phase 1),
+            # stroke the new mini-polyline, mask-merge into path_buffer. path_buffer is
+            # max-merged so previously-stroked pixels persist; we only need to paint the
+            # newly-revealed slice each frame.
+            if last_dirty is None:
+                scratch_ctx.set_operator(cairo.OPERATOR_CLEAR); scratch_ctx.paint()
+                scratch_ctx.set_operator(cairo.OPERATOR_OVER)
+            else:
+                _clear_rect(*last_dirty)
+
+            scratch_ctx.set_line_width(PATH_WIDTH)
+            scratch_ctx.set_source_rgba(1.0, 1.0, 1.0, 1.0)
+            scratch_ctx.move_to(*sub_pts[0])
+            for p in sub_pts[1:]:
+                scratch_ctx.line_to(*p)
+            scratch_ctx.stroke()
+            scratch_surf.flush()
+
+            xs = [p[0] for p in sub_pts]
+            ys = [p[1] for p in sub_pts]
+            pad = PATH_WIDTH * 0.6 + 1.0
+            last_dirty = [min(xs) - pad, min(ys) - pad, max(xs) + pad, max(ys) + pad]
+
+            mask = surface_alpha_f32(scratch_surf)
             np.maximum(path_buffer, mask[..., None] * PATH_COLOR, out=path_buffer)
+            prev_arc = new_arc
 
         np.maximum(path_buffer, endpoint_layer, out=path_buffer)
         hot_buffer *= HOT_COOL_RATE
